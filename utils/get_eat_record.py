@@ -4,6 +4,7 @@ import base64
 import requests
 import json
 from datetime import date, datetime
+from pathlib import Path
 
 def decrypt_aes_ecb(encrypted_data: str) -> str:
     
@@ -41,13 +42,28 @@ def get_record(servicehall, idserial, starttime, endtime):
         "tradetype": -1,
     }
     cookie = {"servicehall": servicehall}
-    response = requests.post(url, params=params, cookies=cookie)
-    
-    encrypted_string = json.loads(response.text)["data"]
+    response = requests.post(url, params=params, cookies=cookie, timeout=30)
+    response.raise_for_status()
+
+    payload = response.json()
+    encrypted_string = payload.get("data")
+    if not encrypted_string:
+        message = payload.get("message") or payload.get("msg") or "The server returned no data"
+        raise ValueError(message)
+
     decrypted_string = decrypt_aes_ecb(encrypted_string)
     data = json.loads(decrypted_string)
-        # dump data as json file
-    data_file_name = f"./eat_records/eat_record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(data_file_name, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+
+    # Saving a local copy is optional. In a PyInstaller executable the working
+    # directory may not contain eat_records (or may not be writable), so a
+    # persistence failure must not turn a successful query into a login error.
+    try:
+        records_dir = Path.cwd() / "eat_records"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        data_file = records_dir / f"eat_record_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with data_file.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except OSError:
+        pass
+
     return data
