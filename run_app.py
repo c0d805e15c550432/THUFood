@@ -9,10 +9,6 @@ def resolve_path(path):
     return os.path.join(basedir, path)
 
 if __name__ == "__main__":
-    # Ensure we are in the correct directory so relative paths work
-    if getattr(sys, "frozen", False):
-        os.chdir(sys._MEIPASS)
-        
     sys.argv = [
         "streamlit",
         "run",

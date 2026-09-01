@@ -2,8 +2,8 @@ import json
 import os
 import sys
 from datetime import date
+from pathlib import Path
 import streamlit as st
-from dotenv import load_dotenv
 import matplotlib.pyplot as plt
 import platform
 import subprocess
@@ -18,10 +18,37 @@ from utils.analyze_data import (
     get_top_counters,
     get_top_locations,
 )
-from utils.get_eat_record import get_record
+from utils.get_eat_record import RecordQueryError, get_record
 from utils.process_data import process_data
 from utils.prompts import get_eat_habbit_prompt
 from utils.ask_gpt import ask_gpt
+from utils.app_paths import records_dir
+from utils.legacy_migration import migrate_legacy_files
+from utils.llm_profiles import (
+    PRESETS,
+    ProfileStoreError,
+    delete_profile,
+    load_profile_api_key,
+    load_profile_state,
+    save_profile,
+    select_profile,
+)
+from utils.auth import (
+    AuthenticationError,
+    SecondFactorChallenge,
+    SecondFactorVerification,
+    complete_second_factor,
+    request_second_factor_code,
+    start_login,
+)
+from utils.trusted_store import load_trusted_device, save_trusted_device
+
+
+SECOND_FACTOR_LABELS = {
+    'enterprise_email': '企业邮箱验证码',
+    'sms': '短信验证码',
+    'totp': 'TOTP 动态验证码',
+}
 
 st.set_page_config(
     page_title="你清食堂消费总结",
@@ -29,42 +56,21 @@ st.set_page_config(
     layout="wide"
 )
 
-# Load environment variables
-load_dotenv()
+def resource_path(*parts):
+    if getattr(sys, 'frozen', False):
+        return Path(sys._MEIPASS).joinpath(*parts)
+    return Path(__file__).resolve().parent.joinpath(*parts)
 
-# Get TEST_MODE from environment variables
-TEST_MODE = os.getenv('TEST_MODE', 'false').lower() == 'true'
 
 # 添加自定义 CSS 样式
 def load_css():
-    # Resolve path so it works when packaged with PyInstaller (sys._MEIPASS)
-    possible_paths = [
-        os.path.join(os.getcwd(), 'utils', 'styles.css'),
-        os.path.join(os.path.dirname(__file__), 'utils', 'styles.css'),
-    ]
-    if getattr(sys, 'frozen', False):
-        possible_paths.insert(0, os.path.join(sys._MEIPASS, 'utils', 'styles.css'))
-
-    css_text = None
-    for p in possible_paths:
-        try:
-            with open(p, 'r', encoding='utf-8') as f:
-                css_text = f.read()
-                break
-        except UnicodeDecodeError:
-            try:
-                with open(p, 'r', encoding='gbk') as f:
-                    css_text = f.read()
-                    break
-            except Exception:
-                try:
-                    with open(p, 'rb') as f:
-                        css_text = f.read().decode('utf-8', errors='replace')
-                        break
-                except Exception:
-                    continue
-        except FileNotFoundError:
-            continue
+    css_path = resource_path('utils', 'styles.css')
+    try:
+        css_text = css_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        css_text = css_path.read_text(encoding='gbk', errors='replace')
+    except OSError:
+        css_text = None
 
     if css_text is None:
         st.warning('无法读取样式文件 `utils/styles.css`，将使用默认样式。')
@@ -171,18 +177,175 @@ def plot_monthly_expenditure(monthly_expenditure):
     fig.tight_layout()
     return fig
 
+def _clear_auth_inputs():
+    """Clear one-time secret widgets and pending callback values."""
+    for key in ('auth_password', 'auth_verification_code', 'manual_servicehall'):
+        if key in st.session_state:
+            st.session_state[key] = ''
+    st.session_state.pop('_submitted_credentials', None)
+
+
+def _reset_auth_flow():
+    """Discard an unfinished login when the user switches mode or starts over."""
+    _clear_auth_inputs()
+    st.session_state.pop('_auth_challenge', None)
+    st.session_state.pop('_auth_verification', None)
+    st.session_state.pop('_auth_pending_username', None)
+    st.session_state.pop('auth_second_factor_method', None)
+
+
+def _take_auth_inputs():
+    # Form callbacks run before the next script execution. Move submitted
+    # secrets out of the widgets, then consume them exactly once in main().
+    credentials = {
+        'password': st.session_state.get('auth_password', ''),
+        'verification_code': st.session_state.get('auth_verification_code', ''),
+        'second_factor_method': st.session_state.get('auth_second_factor_method', ''),
+        'servicehall': st.session_state.get('manual_servicehall', ''),
+    }
+    _clear_auth_inputs()
+    st.session_state['_submitted_credentials'] = credentials
+
+
+def _render_llm_settings():
+    """Render saved profiles and return the active provider configuration."""
+    clear_api_key = st.session_state.pop('_clear_llm_api_key', None)
+    if clear_api_key:
+        st.session_state.pop(clear_api_key, None)
+    state = load_profile_state()
+    profiles = {profile['id']: profile for profile in state['profiles']}
+    options = ['__new__', *profiles]
+    pending = st.session_state.pop('_pending_llm_profile_selection', None)
+    selected_default = pending or state.get('selected') or '__new__'
+    if selected_default not in options:
+        selected_default = '__new__'
+    if st.session_state.get('llm_profile_choice') not in options:
+        st.session_state['llm_profile_choice'] = selected_default
+    selected_id = st.selectbox(
+        "已保存配置",
+        options,
+        format_func=lambda value: "新建配置" if value == '__new__' else profiles[value]['name'],
+        key='llm_profile_choice',
+    )
+    selected = profiles.get(selected_id)
+    if selected:
+        select_profile(selected_id)
+    provider_default = selected['provider'] if selected else 'DeepSeek'
+    provider_key = f"llm_provider_{selected_id}"
+    provider = st.selectbox(
+        "服务商预设", list(PRESETS),
+        index=list(PRESETS).index(provider_default), key=provider_key,
+    )
+    preset = PRESETS[provider]
+    use_saved_values = selected is not None and provider == selected['provider']
+    scope = f"{selected_id}_{provider}"
+    name_scope = selected_id if selected else f"new_{provider}"
+    base_default = selected['base_url'] if use_saved_values else preset['base_url']
+    model_default = selected['model'] if use_saved_values else preset['model']
+    profile_name = st.text_input(
+        "配置名称",
+        value=selected['name'] if selected else f"{provider} 配置",
+        key=f"llm_profile_name_{name_scope}",
+    )
+    base_url = st.text_input(
+        "Base URL",
+        value=base_default,
+        key=f"llm_base_url_{scope}",
+    )
+    model = st.text_input(
+        "Model",
+        value=model_default,
+        key=f"llm_model_{scope}",
+    )
+    api_key_input = st.text_input(
+        "API Key",
+        value="",
+        type="password",
+        placeholder="已保存的密钥不会显示；留空则继续使用",
+        key=f"llm_api_key_{scope}",
+    )
+    saved_api_key = load_profile_api_key(selected_id) if selected else ""
+    active_api_key = api_key_input or saved_api_key
+    save_col, delete_col = st.columns(2)
+    if save_col.button("保存配置", key='save_llm_profile', use_container_width=True):
+        try:
+            saved = save_profile(
+                selected_id if selected else None,
+                profile_name, provider, base_url, model, api_key_input,
+            )
+        except ProfileStoreError as error:
+            st.error(str(error))
+        else:
+            st.session_state['_clear_llm_api_key'] = f"llm_api_key_{scope}"
+            st.session_state['_pending_llm_profile_selection'] = saved['id']
+            st.rerun()
+    if delete_col.button(
+        "删除配置", key='delete_llm_profile', use_container_width=True,
+        disabled=selected is None,
+    ):
+        try:
+            delete_profile(selected_id)
+        except ProfileStoreError as error:
+            st.error(str(error))
+        else:
+            st.session_state['_pending_llm_profile_selection'] = '__new__'
+            st.rerun()
+    st.caption("配置名称、接口和模型保存在用户配置目录；API Key 保存在系统凭据库。")
+    return {
+        "protocol": preset['protocol'],
+        "base_url": base_url.strip(),
+        "model": model.strip(),
+        "api_key": active_api_key,
+    }
+
+
 def main():
+    if not st.session_state.get('_legacy_migration_checked'):
+        st.session_state['_legacy_migration_checked'] = True
+        if os.getenv('THUFOOD_SKIP_LEGACY_MIGRATION') != '1':
+            migration = migrate_legacy_files()
+            if migration.records_moved or migration.env_migrated:
+                migrated = []
+                if migration.records_moved:
+                    migrated.append(f"{migration.records_moved} 份消费记录")
+                if migration.env_migrated:
+                    migrated.append("旧版 AI 配置")
+                st.session_state['_migration_notice'] = (
+                    "已迁移" + "和".join(migrated) + "到稳定用户目录。"
+                )
+            if migration.warnings:
+                st.session_state['_migration_warning'] = " ".join(migration.warnings)
+    pending_manual = st.session_state.pop('_pending_manual_credentials', None)
+    if isinstance(pending_manual, dict):
+        st.session_state.pop('_auth_challenge', None)
+        st.session_state.pop('_auth_verification', None)
+        st.session_state.pop('_auth_pending_username', None)
+        st.session_state['auth_mode'] = '手动输入 servicehall'
+        st.session_state['manual_idserial'] = pending_manual.get('idserial', '')
+        st.session_state['manual_servicehall'] = pending_manual.get('servicehall', '')
+    credentials = st.session_state.pop('_submitted_credentials', {})
     load_css()
     st.title("🍜 你清食堂消费总结")
+    auth_notice = st.session_state.pop('_auth_notice', None)
+    if auth_notice:
+        st.success(auth_notice)
+    auth_warning = st.session_state.pop('_auth_warning', None)
+    if auth_warning:
+        st.warning(auth_warning)
+    migration_notice = st.session_state.pop('_migration_notice', None)
+    if migration_notice:
+        st.success(migration_notice)
+    migration_warning = st.session_state.pop('_migration_warning', None)
+    if migration_warning:
+        st.warning(migration_warning)
     
     # Sidebar for configuration
+    llm_settings = None
     with st.sidebar:
-        llm_submitted = st.toggle("启用 AI 生成评论 🤖", value= False)
+        llm_submitted = st.toggle("启用 AI 生成评论 🤖", value=False, key='llm_enabled')
         if llm_submitted:
             st.header("⚙️ LLM 设置")
-            base_url = st.text_input("Base URL", value=os.getenv("BASE_URL", "https://api.deepseek.com"))
-            model = st.text_input("Model", value=os.getenv("MODEL", "deepseek-chat"))
-            api_key = st.text_input("API Key", value=os.getenv("API_KEY", ""), type="password")
+            llm_settings = _render_llm_settings()
     
     # 更新欢迎页面文案
     st.markdown("""
@@ -191,11 +354,29 @@ def main():
     """)
 
     # 更新用户输入区域文案
-    get_data_online = st.toggle("在线获取数据", value=True, help="如果关闭，则从本地的 json 文件读取数据")
+    get_data_online = st.toggle(
+        "在线获取数据", value=True, help="如果关闭，则从本地的 json 文件读取数据",
+        on_change=_reset_auth_flow,
+    )
+    auth_mode = '账号密码登录'
+    if get_data_online:
+        # Outside the form so changing modes immediately updates its fields.
+        auth_mode = st.radio(
+            "认证方式", ['手动输入 servicehall', '账号密码登录'],
+            horizontal=True, index=1, key='auth_mode', on_change=_reset_auth_flow,
+        )
+        st.caption("密码和验证码仅用于认证，提交后清空，不写入文件或发送给 AI。有效学号和 servicehall 会在当前界面回填到手动模式。")
+        if auth_mode == '账号密码登录':
+            st.caption("先提交学校统一身份认证账号和密码。仅当学校要求二次验证时，界面才会显示企业邮箱、短信或 TOTP 验证选项；学号从认证响应中自动读取。")
+    auth_challenge = st.session_state.get('_auth_challenge')
+    auth_verification = st.session_state.get('_auth_verification')
+    if auth_mode != '账号密码登录':
+        auth_challenge = None
+        auth_verification = None
     with st.form("user_input"):
         if get_data_online:
             st.subheader("🔑 请出示你的美食证件")
-            default_year = 2024 if TEST_MODE else date.today().year
+            default_year = date.today().year
             period_col1, period_col2 = st.columns(2)
             with period_col1:
                 query_start_date = st.date_input(
@@ -206,30 +387,72 @@ def main():
             with period_col2:
                 query_end_date = st.date_input(
                     "查询结束日期",
-                    value=date.today() if not TEST_MODE else date(2024, 12, 31),
+                    value=date.today(),
                     key='query_end_date',
                 )
-            idserial = st.text_input("学号")
-            servicehall = st.text_input("Cookie中的servicehall", help="如何获取？参考 https://github.com/SphenHe/THU-202x-Food")
-            submitted = st.form_submit_button("开启美食档案 🚀")
+            if auth_mode == '账号密码登录':
+                if isinstance(auth_verification, SecondFactorVerification):
+                    login_username = st.session_state.get('_auth_pending_username', '')
+                    method_label = SECOND_FACTOR_LABELS[auth_verification.method]
+                    st.info(f"学校已进入{method_label}流程，请输入收到或身份认证器显示的六位验证码。")
+                    st.text_input(
+                        f"{method_label}", type='password', max_chars=6,
+                        key='auth_verification_code',
+                    )
+                elif isinstance(auth_challenge, SecondFactorChallenge):
+                    login_username = st.session_state.get('_auth_pending_username', '')
+                    st.info("学校要求二次验证。请选择一种可用方式，程序将请求或准备对应验证码。")
+                    st.radio(
+                        "二次验证方式", list(auth_challenge.methods),
+                        format_func=lambda method: SECOND_FACTOR_LABELS[method],
+                        key='auth_second_factor_method',
+                    )
+                else:
+                    login_username = st.text_input("统一身份认证账号", key='auth_username').strip()
+                    st.text_input("统一身份认证密码", type='password', key='auth_password')
+                idserial = ''  # Filled only from the identity login response.
+            else:
+                idserial = st.text_input("学号", key='manual_idserial').strip()
+                st.text_input(
+                    "Cookie中的servicehall", type='password', key='manual_servicehall',
+                    help="在校园卡官网登录后复制 servicehall= 后的值，不包含 servicehall= 或其他 Cookie。",
+                )
+            servicehall = credentials.get('servicehall', '').strip()
+            if isinstance(auth_verification, SecondFactorVerification):
+                submit_label = "验证并开启美食档案 🚀"
+            elif isinstance(auth_challenge, SecondFactorChallenge):
+                submit_label = "获取或准备验证码"
+            else:
+                submit_label = "开启美食档案 🚀"
+            submitted = st.form_submit_button(submit_label, on_click=_take_auth_inputs)
             if submitted:
-                if not idserial or not servicehall:
-                    st.error("⚠️ 请填写完整信息！")
+                if auth_mode == '手动输入 servicehall' and (not idserial or not servicehall):
+                    st.error("⚠️ 请填写学号和 servicehall！")
+                    return
+                if (
+                    auth_mode == '账号密码登录'
+                    and not isinstance(auth_challenge, SecondFactorChallenge)
+                    and not isinstance(auth_verification, SecondFactorVerification)
+                    and (not login_username or not credentials.get('password'))
+                ):
+                    st.error("⚠️ 请填写统一身份认证账号和密码！")
+                    return
+                if auth_mode == '账号密码登录' and isinstance(auth_verification, SecondFactorVerification) and (
+                    len(credentials.get('verification_code', '')) != 6
+                    or not credentials.get('verification_code', '').isdigit()
+                ):
+                    st.error("⚠️ 二次验证码必须是六位数字！")
                     return
                 if query_start_date > query_end_date:
                     st.error("⚠️ 查询开始日期不能晚于结束日期！")
                     return
         else:
-            # 设置文件夹路径（修改为你的实际路径）
-            folder_path = "./eat_records"  # 替换为你的文件夹路径
-            # 获取文件夹中的所有文件
-            try:
-                file_list = sorted([f for f in os.listdir(folder_path) 
-                            if os.path.isfile(os.path.join(folder_path, f))], reverse=True)
-            except FileNotFoundError:
-                st.error("❌ 文件夹不存在，请检查路径")
-                file_list = []
-            # 创建下拉选择框
+            folder_path = records_dir()
+            file_list = sorted(
+                (path.name for path in folder_path.glob("*.json") if path.is_file()),
+                reverse=True,
+            ) if folder_path.is_dir() else []
+            st.caption(f"本地记录目录：{folder_path}")
             if file_list:
                 selected_file = st.selectbox(
                     "请选择文件：",
@@ -237,47 +460,94 @@ def main():
                     index=0  # 默认选中第一个文件
                 )
                 submitted = st.form_submit_button(f"通过{selected_file}开启美食档案 🚀")
-                
-                # 这里可以添加文件处理逻辑
-                # file_path = os.path.join(folder_path, selected_file)
-                # ...
             else:
-                st.warning("⚠️ 文件夹为空或路径错误")
-                st.subheader("📂 从本地文件读取数据")
-                st.markdown("请确保当前目录下有名为 `log.json` 的文件，且格式正确。")
-                submitted = st.form_submit_button("从本地文件读取数据 📂")
+                st.warning("⚠️ 稳定数据目录中暂无消费记录，请先在线查询一次。")
+                submitted = st.form_submit_button("暂无可分析的本地记录", disabled=True)
+                selected_file = None
                 idserial = None
                 servicehall = None
                 
 
-        if TEST_MODE:
-            idserial = "2025012345"
-            servicehall = "1234567890"
-            submitted = 'report_data' not in st.session_state
-
         # After the form submission check
         if submitted:
+            st.session_state.pop('report_data', None)
+            st.session_state.pop('ai_comments', None)
 
             # First spinner for data fetching
             with st.spinner("正在获取数据，请稍候..."):
+                auto_manual_credentials = None
                 try:
                     data = None
                     if get_data_online:
-                        data = (
-                            get_record(
-                                servicehall,
-                                idserial,
-                                query_start_date,
-                                query_end_date,
-                            )
-                            if not TEST_MODE
-                            else json.load(open("log.json", "r", encoding='utf-8'))
+                        if auth_mode == '账号密码登录':
+                            with st.spinner("正在完成学校认证并验证校园卡会话..."):
+                                if isinstance(auth_verification, SecondFactorVerification):
+                                    login = complete_second_factor(
+                                        auth_verification,
+                                        credentials.pop('verification_code', ''),
+                                    )
+                                    st.session_state.pop('_auth_verification', None)
+                                    st.session_state.pop('_auth_challenge', None)
+                                    st.session_state.pop('_auth_pending_username', None)
+                                    if login.trusted_device is not None:
+                                        trusted_devices = st.session_state.setdefault('_trusted_devices', {})
+                                        trusted_devices[login_username] = login.trusted_device
+                                        if not save_trusted_device(login_username, login.trusted_device):
+                                            st.session_state['_auth_warning'] = (
+                                                "可信设备已在本次运行中生效，但未能写入系统凭据库；程序重启后可能再次要求二次验证。"
+                                            )
+                                    if not login.trust_saved:
+                                        st.session_state['_auth_warning'] = (
+                                            "二次验证已成功，但学校没有返回可信设备令牌；下次登录可能仍需验证。"
+                                        )
+                                elif isinstance(auth_challenge, SecondFactorChallenge):
+                                    verification = request_second_factor_code(
+                                        auth_challenge,
+                                        credentials.get('second_factor_method', ''),
+                                    )
+                                    st.session_state['_auth_verification'] = verification
+                                    st.rerun()
+                                else:
+                                    trusted_devices = st.session_state.setdefault('_trusted_devices', {})
+                                    trusted_device = trusted_devices.get(login_username)
+                                    if trusted_device is None:
+                                        trusted_device = load_trusted_device(login_username)
+                                        if trusted_device is not None:
+                                            trusted_devices[login_username] = trusted_device
+                                    login = start_login(
+                                        login_username,
+                                        credentials.pop('password'),
+                                        trusted_device=trusted_device,
+                                    )
+                                    if isinstance(login, SecondFactorChallenge):
+                                        st.session_state['_auth_challenge'] = login
+                                        st.session_state['_auth_pending_username'] = login_username
+                                        st.rerun()
+                            servicehall = login.servicehall
+                            idserial = login.idserial
+                            if not idserial:
+                                raise AuthenticationError("登录响应未返回有效学号，请重新登录或切换手动输入 servicehall。")
+                            auto_manual_credentials = {
+                                'idserial': idserial,
+                                'servicehall': servicehall,
+                            }
+                        data = get_record(
+                            servicehall,
+                            idserial,
+                            query_start_date,
+                            query_end_date,
                         )
                     else:
-                        data = json.load(open(os.path.join(folder_path, selected_file), "r", encoding='utf-8'))
+                        data = json.loads((folder_path / selected_file).read_text(encoding='utf-8'))
                     df_raw, df = process_data(data)
                     if df_raw.empty:
                         st.session_state.pop('report_data', None)
+                        if auto_manual_credentials:
+                            st.session_state['_pending_manual_credentials'] = auto_manual_credentials
+                            st.session_state['_auth_notice'] = (
+                                "账号认证成功，已切换到手动 servicehall 模式并填入有效学号与 Cookie；所选时间段没有消费记录。"
+                            )
+                            st.rerun()
                         st.warning("所选时间段内没有消费记录，请调整查询日期后重试。")
                         return
                     username = df['username'].iloc[0]
@@ -296,10 +566,36 @@ def main():
                             query_end_date if get_data_online else df_raw['txdate'].max().date()
                         ),
                     }
+                    if auto_manual_credentials:
+                        st.session_state['_pending_manual_credentials'] = auto_manual_credentials
+                        st.session_state['_auth_notice'] = (
+                            "账号认证和数据查询成功，已切换到手动 servicehall 模式并自动填入有效学号与 Cookie。"
+                        )
+                        st.rerun()
                     st.success("✅ 数据获取成功")
-                except Exception as e:
-                    st.error(f"❌ 数据获取失败，请检查学号和 Cookie 是否正确，并确认 Cookies 是在本电脑上获取的（而不是来自其他同学的设备）")
+                except RecordQueryError as e:
+                    if auto_manual_credentials:
+                        st.session_state['_pending_manual_credentials'] = auto_manual_credentials
+                        st.session_state['_auth_warning'] = (
+                            f"账号认证已完成并已切换到手动模式，但本次消费记录查询失败：{e}"
+                        )
+                        st.rerun()
+                    if get_data_online and auth_mode == '手动输入 servicehall':
+                        st.error(
+                            f"❌ servicehall 可能已失效或无法用于当前查询：{e}"
+                            " 建议切换到账号密码登录，重新获取有效学号与 servicehall。"
+                        )
+                    else:
+                        st.error(f"❌ {e}")
                     return
+                except AuthenticationError as e:
+                    st.error(f"❌ {e}")
+                    return
+                except Exception:
+                    st.error("❌ 数据获取失败，请检查网络、查询学号和数据格式后重试。认证凭证不会被输出。")
+                    return
+                finally:
+                    credentials.clear()
 
     report_data = st.session_state.get('report_data')
     if report_data:
@@ -460,67 +756,75 @@ def main():
                         st.subheader("🤡 最逆天的一餐")
                         earliest, latest = get_time_bounds(df)
                         most_expensive = get_max_cost(df)
-                        
-                        earliest_prompt = get_eat_habbit_prompt(username, earliest)
-                        latest_prompt = get_eat_habbit_prompt(username, latest)
-                        most_expensive_prompt = get_eat_habbit_prompt(username, most_expensive)
-                        
-                        try:
-                            earliest_comment = ask_gpt(earliest_prompt, model=model, api_key=api_key, base_url=base_url)
-                            latest_comment = ask_gpt(latest_prompt, model=model, api_key=api_key, base_url=base_url)
-                            most_expensive_comment = ask_gpt(most_expensive_prompt, model=model, api_key=api_key, base_url=base_url)
-                        except Exception as e:
-                            st.error(
-                                "❌ 调用 AI 失败，请检查侧边栏的设置并重试，这可能是由于以下原因之一：\n\n"
-                                "1. API Key 不正确或已过期（一般为 `sk-*****` 的形式）\n"
-                                "2. Base URL 配置错误（一般为 `https://api.deepseek.com` 的形式）\n"
-                                "3. 模型名称错误或不可用（一般为 `deepseek-chat` 的形式）\n\n"
-                                f"错误信息: {str(e)}"
-                            )
-                            earliest_comment = "无法生成评论"
-                            latest_comment = "无法生成评论"
-                            most_expensive_comment = "无法生成评论"
 
-                        col1, col2, col3 = st.columns(3)
-                        
-                        with col1:
-                            st.markdown(
-                                create_stat_card(
-                                    "清晨觅食冠军", 
-                                    earliest['txdate'].strftime('%H:%M'),
-                                    earliest['meraddr'],
-                                    earliest['txdate'].strftime('%Y-%m-%d'),
-                                    earliest_comment,
-                                    "☀️"
-                                ),
-                                unsafe_allow_html=True
-                            )
-                        
-                        with col2:
-                            st.markdown(
-                                create_stat_card(
-                                    "夜宵王者",
-                                    latest['txdate'].strftime('%H:%M'),
-                                    latest['meraddr'],
-                                    latest['txdate'].strftime('%Y-%m-%d'),
-                                    latest_comment,
-                                    "🌙"
-                                ),
-                                unsafe_allow_html=True
-                            )
+                        st.caption("确认侧边栏中的服务商、模型和密钥后，点击按钮才会调用 AI；页面普通重跑不会重复生成。")
+                        generate_comments = st.button(
+                            "开始生成", key="generate_ai_comments", type="primary",
+                            use_container_width=True,
+                        )
+                        if generate_comments:
+                            earliest_prompt = get_eat_habbit_prompt(username, earliest)
+                            latest_prompt = get_eat_habbit_prompt(username, latest)
+                            most_expensive_prompt = get_eat_habbit_prompt(username, most_expensive)
+                            try:
+                                with st.spinner("正在生成 AI 评论，请稍候..."):
+                                    st.session_state['ai_comments'] = {
+                                        'earliest': ask_gpt(earliest_prompt, **llm_settings),
+                                        'latest': ask_gpt(latest_prompt, **llm_settings),
+                                        'most_expensive': ask_gpt(most_expensive_prompt, **llm_settings),
+                                    }
+                            except Exception as e:
+                                st.session_state.pop('ai_comments', None)
+                                st.error(
+                                    "❌ 调用 AI 失败，请检查侧边栏的设置并重试，这可能是由于以下原因之一：\n\n"
+                                    "1. API Key 不正确或已过期（一般为 `sk-*****` 的形式）\n"
+                                    "2. Base URL 配置错误\n"
+                                    "3. 模型名称错误或不可用\n\n"
+                                    f"错误信息: {str(e)}"
+                                )
 
-                        with col3:
-                            st.markdown(
-                                create_stat_card(
-                                    "土豪餐王",
-                                    f"¥{most_expensive['txamt']:.2f}",
-                                    most_expensive['meraddr'],
-                                    most_expensive['txdate'].strftime('%Y-%m-%d %H:%M'),
-                                    most_expensive_comment,
-                                    "💫"
-                                ),
-                                unsafe_allow_html=True
-                            )
+                        ai_comments = st.session_state.get('ai_comments')
+                        if ai_comments:
+                            col1, col2, col3 = st.columns(3)
+
+                            with col1:
+                                st.markdown(
+                                    create_stat_card(
+                                        "清晨觅食冠军",
+                                        earliest['txdate'].strftime('%H:%M'),
+                                        earliest['meraddr'],
+                                        earliest['txdate'].strftime('%Y-%m-%d'),
+                                        ai_comments['earliest'],
+                                        "☀️"
+                                    ),
+                                    unsafe_allow_html=True
+                                )
+
+                            with col2:
+                                st.markdown(
+                                    create_stat_card(
+                                        "夜宵王者",
+                                        latest['txdate'].strftime('%H:%M'),
+                                        latest['meraddr'],
+                                        latest['txdate'].strftime('%Y-%m-%d'),
+                                        ai_comments['latest'],
+                                        "🌙"
+                                    ),
+                                    unsafe_allow_html=True
+                                )
+
+                            with col3:
+                                st.markdown(
+                                    create_stat_card(
+                                        "土豪餐王",
+                                        f"¥{most_expensive['txamt']:.2f}",
+                                        most_expensive['meraddr'],
+                                        most_expensive['txdate'].strftime('%Y-%m-%d %H:%M'),
+                                        ai_comments['most_expensive'],
+                                        "💫"
+                                    ),
+                                    unsafe_allow_html=True
+                                )
                     
 
                     

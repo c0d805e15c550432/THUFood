@@ -1,13 +1,7 @@
-import os
-import sys
-import json
 import platform
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.process_data import process_data
 
 def get_time_bounds(df):
     earliest = df.loc[df['time_only'].idxmin()]
@@ -136,16 +130,3 @@ def _plot_patterns(stats):
     
     plt.tight_layout()
     plt.show()
-
-def main():
-    data = json.load(open("log.json", "r", encoding='utf-8'))
-    df_raw, df = process_data(data)
-    get_time_bounds(df)
-    get_costs(df)
-    get_top_locations(df)
-    get_top_counters(df)
-    get_max_cost(df)
-    analyze_patterns(df)
-
-if __name__ == "__main__":
-    main()

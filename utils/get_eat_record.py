@@ -4,7 +4,13 @@ import base64
 import requests
 import json
 from datetime import date, datetime
-from pathlib import Path
+
+from utils.app_paths import records_dir
+
+
+class RecordQueryError(ValueError):
+    """Safe error text for the query UI, without server payloads or cookies."""
+
 
 def decrypt_aes_ecb(encrypted_data: str) -> str:
     
@@ -42,25 +48,39 @@ def get_record(servicehall, idserial, starttime, endtime):
         "tradetype": -1,
     }
     cookie = {"servicehall": servicehall}
-    response = requests.post(url, params=params, cookies=cookie, timeout=30)
+    try:
+        response = requests.post(
+            url, params=params, cookies=cookie, timeout=30,
+            allow_redirects=False, verify=True,
+        )
+    except requests.RequestException:
+        raise RecordQueryError("无法连接校园卡查询接口，请检查校园网或 VPN 后重试。") from None
+    if response.status_code in (301, 302, 303, 307, 308, 401, 403):
+        raise RecordQueryError("servicehall 未登录或已过期，请重新登录或重新获取 Cookie。")
     response.raise_for_status()
 
-    payload = response.json()
-    encrypted_string = payload.get("data")
-    if not encrypted_string:
-        message = payload.get("message") or payload.get("msg") or "The server returned no data"
-        raise ValueError(message)
-
-    decrypted_string = decrypt_aes_ecb(encrypted_string)
-    data = json.loads(decrypted_string)
-
-    # Saving a local copy is optional. In a PyInstaller executable the working
-    # directory may not contain eat_records (or may not be writable), so a
-    # persistence failure must not turn a successful query into a login error.
     try:
-        records_dir = Path.cwd() / "eat_records"
-        records_dir.mkdir(parents=True, exist_ok=True)
-        data_file = records_dir / f"eat_record_{datetime.now():%Y%m%d_%H%M%S}.json"
+        payload = response.json()
+    except ValueError:
+        raise RecordQueryError("校园卡未返回查询数据，登录可能已过期，请重新获取 servicehall。") from None
+    if not isinstance(payload, dict):
+        raise RecordQueryError("校园卡查询接口返回了无法识别的数据。")
+    encrypted_string = payload.get("data")
+    if not isinstance(encrypted_string, str) or not encrypted_string:
+        raise RecordQueryError("查询未成功，请确认学号属于当前登录账号，或重新获取 servicehall。")
+
+    try:
+        decrypted_string = decrypt_aes_ecb(encrypted_string)
+        data = json.loads(decrypted_string)
+    except (ValueError, TypeError):
+        raise RecordQueryError("校园卡查询数据无法解析，请重新登录后重试。") from None
+
+    # Persistent user data stays outside both the source tree and PyInstaller's
+    # temporary extraction directory.
+    try:
+        destination = records_dir()
+        destination.mkdir(parents=True, exist_ok=True)
+        data_file = destination / f"eat_record_{datetime.now():%Y%m%d_%H%M%S}.json"
         with data_file.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
     except OSError:

@@ -1,0 +1,14 @@
+.git
+.github
+.env*
+.venv
+__pycache__
+*.py[cod]
+build
+dist
+eat_records
+log.json
+config.json
+llm_profiles.json
+tests
+*.har

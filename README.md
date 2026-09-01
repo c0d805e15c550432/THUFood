@@ -11,6 +11,7 @@
 > 2. 分别统计每个月的消费情况；
 > 3. AI评论可选择关闭 ；
 > 4. 每次查询时会在本地保留记录，后续可使用前期保存的记录直接进行分析，而无需每次重新获取数据。
+> 5. 在线查询可选择手动输入 `servicehall`，或输入统一身份认证账号密码，自动完成校园卡登录并获取 Cookie。
 >
 >为了确保您的隐私与数据安全，在此只建议**使用 [Release](https://github.com/c0d805e15c550432/THUFood) 中打包好的版本**或者**自行本地部署**。
 >
@@ -25,7 +26,38 @@
 ![demo](./demo.png)
 ![demo2](./demo2.png)
 
-### 获取服务代码
+### 选择认证方式
+
+打开“在线获取数据”后，可选择：
+
+- **账号密码登录（默认）**：第一步只填写学校统一身份认证账号和密码。程序识别到二次验证后，才显示服务器实际提供的企业邮箱、短信和 TOTP 选项；选择一种方式获取或准备验证码，再输入六位验证码。程序从认证响应的 `Set-Cookie: TSINGHUAUSERID=...` 自动提取学号，完成票据回跳并验证校园卡 Cookie；账号模式不显示学号输入框。登录和查询成功后自动切换到手动模式，并回填有效学号与 `servicehall`。
+- **手动输入 servicehall**：填写本人学号和按下面步骤获取的 Cookie 值。查询失败时会提示 Cookie 可能失效，并建议切换回账号密码登录。
+
+密码和验证码在提交后清空，不写入文件、不发送给 AI。二次验证成功后，程序请求将当前客户端设备设为可信；指纹和信任令牌通过 `keyring` 保存到当前操作系统用户的安全凭据库：Windows 使用 Credential Manager，macOS 使用 Keychain，桌面 Linux 使用 Secret Service 或 KWallet，因此重启程序后仍可复用。账号名只以哈希形式作为凭据条目标识。请仅在本机或可信部署中输入认证信息。
+
+校园卡认证、二次验证和消费查询均启用 TLS 证书校验。若使用 HTTPS 调试代理，需要将代理 CA 正确安装到 Python/系统信任链；程序不会忽略证书错误。
+
+企业邮箱验证码、短信验证码和 TOTP 已由账号密码模式分阶段支持。如果学校要求图形验证码、扫码、改密或其他尚未适配的交互验证，请在官网完成登录，再切换为手动模式。程序不会绕过验证，也不会自动反复尝试密码或验证码。详细协议、HAR 分析和代码调用方式见 [认证分析](docs/authentication.md)。
+
+### AI 评论配置
+
+侧边栏可保存并快速切换多套 AI 配置。内置 DeepSeek（首选）、OpenAI、Claude、Grok、Ollama、Gemini、千问、智谱、Kimi、MiniMax 和并行智算云预设；Base URL 与模型名称均可编辑。配置名称、接口和模型保存在用户配置目录，API Key 保存在系统安全凭据库，不写入配置 JSON 或日志。打开 AI 开关只会显示配置和评论区域；只有点击报告底部的“开始生成”按钮才会请求模型，普通页面刷新不会重复生成。模型名称可能随供应商更新，请以各平台当前控制台为准。
+
+### 持久化目录
+
+程序资源和用户数据已经分离，PyInstaller `onefile` 的临时解压目录不再用于保存数据：
+
+| 平台 | AI 配置 | 消费记录 |
+|---|---|---|
+| Windows | `%APPDATA%\THUFood\llm_profiles.json` | `%LOCALAPPDATA%\THUFood\eat_records` |
+| macOS | `~/Library/Application Support/THUFood/llm_profiles.json` | `~/Library/Application Support/THUFood/eat_records` |
+| Linux | `$XDG_CONFIG_HOME/THUFood/llm_profiles.json` | `$XDG_DATA_HOME/THUFood/eat_records` |
+
+Linux 未设置 XDG 变量时，默认分别使用 `~/.config/THUFood` 和 `~/.local/share/THUFood`。如需便携部署，可以在真正的系统环境变量中设置 `THUFOOD_CONFIG_DIR` 和 `THUFOOD_DATA_DIR`；程序不再读取项目目录中的 `.env` 文件。
+
+升级后首次启动会迁移旧 `eat_records` 目录以及 `.env` 中的 `BASE_URL`、`MODEL` 和 `API_KEY`。接口与模型进入配置 JSON，API Key 进入系统凭据库；只有全部写入成功后才删除旧 `.env`。消费记录复制并校验成功后才删除旧文件。
+
+### 手动获取服务代码
 
 首先，登录校园卡账号后，在[华清大学校园卡网站](https://card.tsinghua.edu.cn/userselftrade)获取你的服务代码。
 
@@ -55,17 +87,13 @@ conda activate thueat
 pip install -r requirements.txt
 ```
 
-4. 配置环境变量：
-```bash
-cp .env.example .env
-```
-编辑 `.env` 文件，填入必要的 API 信息、BASE_URL 以及模型名称
-
-5. 运行应用：
+4. 运行应用：
 ```bash
 streamlit run st.py
 ```
 或双击start.bat(仅Windows)
+
+AI 接口、模型和 API Key 均在侧边栏配置，无需创建 `.env`。更新已有环境后，需要重新执行 `pip install -r requirements.txt` 安装 `gmalg`、`keyring` 和 `platformdirs`。系统没有可用凭据库时仍可查询，但可信设备令牌和 AI Key 无法安全地跨重启保存。
 
 ### 方式二：使用 Docker
 
@@ -74,16 +102,14 @@ streamlit run st.py
 2. 构建并运行：
 ```bash
 docker build -t thu202x-food .
-docker run -p 3000:3000 --env-file .env thu202x-food
+docker run -p 3000:3000 \
+  -e THUFOOD_CONFIG_DIR=/data/config \
+  -e THUFOOD_DATA_DIR=/data/files \
+  -v thufood-data:/data \
+  thu202x-food
 ```
 
-3. 设置环境变量：
-```bash
-cp .env.example .env
-```
-编辑 `.env` 文件，填入必要的 API 信息、BASE_URL 以及模型名称
-
-4. 访问 http://localhost:3000 即可使用。
+3. 访问 http://localhost:3000 即可使用。上述命名卷会持久保存非敏感配置和消费记录。普通无桌面容器通常没有系统凭据库，API Key 和可信设备令牌不会自动持久化；生产部署应连接外部密钥管理服务，或在每次容器会话中重新输入。
 
 ## LICENSE
 

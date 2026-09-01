@@ -17,7 +17,6 @@ sep = ';' if system == 'Windows' else ':'
 datas = [
     f'st.py{sep}.',
     f'utils{sep}utils',
-    f'log.json{sep}.',
 ]
 
 # PyInstaller arguments (minimize collected modules to reduce bundle size)
@@ -30,12 +29,15 @@ args = [
     '--collect-all=pandas',
     '--collect-all=matplotlib',
     '--collect-all=sklearn',
+    '--collect-all=keyring',
     '--hidden-import=streamlit',
-    '--hidden-import=dotenv',
     '--hidden-import=Crypto.Cipher.AES',
     '--hidden-import=Crypto.Util.Padding',
     '--hidden-import=openai',
     '--hidden-import=requests',
+    '--hidden-import=gmalg',
+    '--hidden-import=keyring',
+    '--hidden-import=platformdirs',
     '--hidden-import=matplotlib.pyplot',
     '--hidden-import=sklearn.preprocessing'
 ]
