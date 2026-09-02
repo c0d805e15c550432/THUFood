@@ -29,13 +29,13 @@ PRESETS = {
         "protocol": "openai", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "model": "gemini-3.7-flash",
     },
     "千问": {
-        "protocol": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus",
+        "protocol": "openai", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-3.8-max",
     },
     "智谱": {
-        "protocol": "openai", "base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-5.2",
+        "protocol": "openai", "base_url": "https://open.bigmodel.cn/api/paas/v4/", "model": "glm-5.3",
     },
     "Kimi": {
-        "protocol": "openai", "base_url": "https://api.moonshot.cn/v1", "model": "kimi-k2.6",
+        "protocol": "openai", "base_url": "https://api.moonshot.cn/v1", "model": "kimi-k3",
     },
     "MiniMax": {
         "protocol": "openai", "base_url": "https://api.minimaxi.com/v1", "model": "MiniMax-M2.7",

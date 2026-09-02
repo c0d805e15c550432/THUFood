@@ -184,5 +184,6 @@ log.json
 
 # Captured traffic/pages can contain real credentials and personal information.
 # Keep Python regression tests trackable without committing those captures.
-tests/*
-!tests/test_*.py
+/tests
+
+/docs

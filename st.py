@@ -365,9 +365,7 @@ def main():
             "认证方式", ['手动输入 servicehall', '账号密码登录'],
             horizontal=True, index=1, key='auth_mode', on_change=_reset_auth_flow,
         )
-        st.caption("密码和验证码仅用于认证，提交后清空，不写入文件或发送给 AI。有效学号和 servicehall 会在当前界面回填到手动模式。")
-        if auth_mode == '账号密码登录':
-            st.caption("先提交学校统一身份认证账号和密码。仅当学校要求二次验证时，界面才会显示企业邮箱、短信或 TOTP 验证选项；学号从认证响应中自动读取。")
+        st.caption("密码和验证码仅用于认证，提交后清空，不写入文件或发送给 AI。")
     auth_challenge = st.session_state.get('_auth_challenge')
     auth_verification = st.session_state.get('_auth_verification')
     if auth_mode != '账号密码登录':
@@ -394,14 +392,14 @@ def main():
                 if isinstance(auth_verification, SecondFactorVerification):
                     login_username = st.session_state.get('_auth_pending_username', '')
                     method_label = SECOND_FACTOR_LABELS[auth_verification.method]
-                    st.info(f"学校已进入{method_label}流程，请输入收到或身份认证器显示的六位验证码。")
+                    st.info(f"已进入{method_label}流程，请输入六位验证码。")
                     st.text_input(
                         f"{method_label}", type='password', max_chars=6,
                         key='auth_verification_code',
                     )
                 elif isinstance(auth_challenge, SecondFactorChallenge):
                     login_username = st.session_state.get('_auth_pending_username', '')
-                    st.info("学校要求二次验证。请选择一种可用方式，程序将请求或准备对应验证码。")
+                    st.info("学校要求二次验证。请选择一种可用方式。")
                     st.radio(
                         "二次验证方式", list(auth_challenge.methods),
                         format_func=lambda method: SECOND_FACTOR_LABELS[method],
@@ -757,7 +755,7 @@ def main():
                         earliest, latest = get_time_bounds(df)
                         most_expensive = get_max_cost(df)
 
-                        st.caption("确认侧边栏中的服务商、模型和密钥后，点击按钮才会调用 AI；页面普通重跑不会重复生成。")
+                        st.caption("确认侧边栏中的服务商、模型和密钥后，点击按钮调用 AI 生成评论。")
                         generate_comments = st.button(
                             "开始生成", key="generate_ai_comments", type="primary",
                             use_container_width=True,
