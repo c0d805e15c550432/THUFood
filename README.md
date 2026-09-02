@@ -17,9 +17,9 @@
 >
 > 打包好的版本如下:
 >
-> - [Windows](https://github.com/c0d805e15c550432/THUFood/releases/download/THU-Food-Summary-windows-latest.exe)
-> - [MacOS](https://github.com/c0d805e15c550432/THUFood/releases/download/THU-Food-Summary-macos-latest)
-> - [Linux(Ubuntu)](https://github.com/c0d805e15c550432/THUFood/releases/download/download/THU-Food-Summary-ubuntu-latest)。
+> - [Windows](https://github.com/c0d805e15c550432/THUFood/releases/latest/download/THU-Food-Summary-windows-latest.exe)
+> - [MacOS](https://github.com/c0d805e15c550432/THUFood/releases/latest/download/THU-Food-Summary-macos-latest)
+> - [Linux(Ubuntu)](https://github.com/c0d805e15c550432/THUFood/releases/latest/download/THU-Food-Summary-ubuntu-latest)。
 
 本项目是一个用于统计清华大学学生在食堂（和宿舍）的消费情况的可视化工具。通过模拟登录清华大学校园卡网站，获取学生在食堂的消费记录，并通过数据可视化的方式展示。
 
